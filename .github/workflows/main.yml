@@ -1,10 +1,10 @@
-name: sqlmap test against login (authorized use only)
+name: Build sqlmap image and run (authorized targets only)
 
 on:
   workflow_dispatch:
     inputs:
       target_url:
-        description: 'Login URL (full) e.g. https://wordplease.example/login'
+        description: 'Login URL (full). If empty, will use TARGET_URL secret'
         required: false
         default: ''
       username:
@@ -12,114 +12,154 @@ on:
         required: false
         default: 'yuki571'
       use_csrf:
-        description: 'Whether the login form uses a CSRF token (true/false)'
+        description: 'true/false - whether to attempt to extract CSRF token from the login page'
         required: false
         default: 'false'
+      password_placeholder:
+        description: 'Placeholder password to include in POST body (sqlmap injects into parameters)'
+        required: false
+        default: 'placeholder'
+      dump_on_find:
+        description: 'true/false - if true, will append --dump when sqlmap reports injection (only for owned/test systems)'
+        required: false
+        default: ''
 
 jobs:
-  run-sqlmap:
+  build-and-run:
     runs-on: ubuntu-latest
-    env:
-      # These should be set as repository secrets or entered in the workflow_dispatch UI
-      TARGET_URL: ${{ github.event.inputs.target_url || secrets.TARGET_URL }}
-      USERNAME: ${{ github.event.inputs.username }}
-      USE_CSRF: ${{ github.event.inputs.use_csrf }}
-      # Optional: set a "marker" secret proving authorization (recommended)
-      AUTH_PROOF: ${{ secrets.AUTH_PROOF }}
     steps:
-      - name: Safety checks (must be owner / authorized)
+      - name: Safety/inputs check
+        id: check
         run: |
-          echo "This workflow must only be used against targets you OWN or are explicitly AUTHORIZED to test."
-          if [ -z "$TARGET_URL" ]; then
-            echo "ERROR: TARGET_URL must be set either in workflow input or repository secret."
+          TARGET="${{ github.event.inputs.target_url || secrets.TARGET_URL }}"
+          USER="${{ github.event.inputs.username }}"
+          if [ -z "$TARGET" ]; then
+            echo "ERROR: TARGET URL not provided (set workflow input or TARGET_URL secret)."
             exit 1
           fi
-          if [ -z "$AUTH_PROOF" ]; then
-            echo "WARNING: AUTH_PROOF secret not set. It's strongly recommended to set a secret that proves authorization for the target."
+          echo "target=$TARGET" >> $GITHUB_OUTPUT
+          echo "username=$USER" >> $GITHUB_OUTPUT
+          echo "use_csrf=${{ github.event.inputs.use_csrf }}" >> $GITHUB_OUTPUT
+          echo "password_placeholder=${{ github.event.inputs.password_placeholder }}" >> $GITHUB_OUTPUT
+          echo "dump_on_find=${{ github.event.inputs.dump_on_find || secrets.DUMP_ON_FIND }}" >> $GITHUB_OUTPUT
+          if [ -z "${{ secrets.AUTH_PROOF }}" ]; then
+            echo "NOTE: AUTH_PROOF not set as a secret. Recommended to set to prove authorization."
+          else
+            echo "AUTH_PROOF present (not shown)."
           fi
-          echo "Target: $TARGET_URL"
-          echo "Username: $USERNAME"
-          echo "USE_CSRF: $USE_CSRF"
 
-      - name: Install curl (small helper)
-        run: sudo apt-get update -y && sudo apt-get install -y curl jq
-
-      - name: If CSRF, fetch token from login page
-        if: env.USE_CSRF == 'true'
+      - name: Install tools
         run: |
-          # Example: try to extract a token named csrf_token from HTML input
-          # You may need to adjust the grep/sed pattern to match your page
-          echo "Fetching login page to extract CSRF token..."
-          curl -s -c /tmp/cookies.txt "$TARGET_URL" -o /tmp/loginpage.html
-          # Adjust the pattern below to the actual name/id of your CSRF field
+          sudo apt-get update -y
+          sudo apt-get install -y git curl jq docker.io
+          # start docker (runner usually has it, but ensure service)
+          sudo systemctl start docker || true
+          docker --version
+
+      - name: Clone sqlmap upstream
+        run: |
+          rm -rf /tmp/sqlmap_repo
+          git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git /tmp/sqlmap_repo
+          ls -la /tmp/sqlmap_repo | sed -n '1,120p'
+
+      - name: Create Dockerfile (simple wrapper)
+        run: |
+          cat > /tmp/sqlmap_repo/Dockerfile <<'EOF'
+          FROM python:3.11-slim
+          WORKDIR /sqlmap
+          COPY . /sqlmap
+          # optional: install additional packages if needed
+          RUN apt-get update && apt-get install -y --no-install-recommends git curl && \
+              pip install --no-cache-dir -r requirements.txt 2>/dev/null || true
+          ENTRYPOINT ["python3", "sqlmap.py"]
+          EOF
+          sed -n '1,120p' /tmp/sqlmap_repo/Dockerfile
+
+      - name: Build sqlmap docker image
+        run: |
+          cd /tmp/sqlmap_repo
+          sudo docker build -t my-sqlmap:ci .
+          sudo docker images my-sqlmap:ci
+
+      - name: (Optional) Extract CSRF token from login page
+        if: ${{ github.event.inputs.use_csrf == 'true' }}
+        run: |
+          TARGET="${{ steps.check.outputs.target }}"
+          echo "Fetching login page to try to find CSRF token..."
+          curl -s -c /tmp/cookies.txt "$TARGET" -o /tmp/loginpage.html || true
+          # try common patterns; adjust to your page as needed
           CSRF=$(grep -oP 'name="csrf_token" value="\K[^"]+' /tmp/loginpage.html || true)
           if [ -z "$CSRF" ]; then
-            echo "Could not auto-extract CSRF token with the default pattern. Dumping snippet for debugging:"
-            sed -n '1,200p' /tmp/loginpage.html
-            echo "Please adjust the grep/sed pattern in the workflow to match your site's token field."
-            exit 1
+            CSRF=$(grep -oP 'name="csrf" value="\K[^"]+' /tmp/loginpage.html || true)
           fi
-          echo "Extracted CSRF token: $CSRF"
-          echo "CSRF_TOKEN=$CSRF" >> $GITHUB_ENV
-          echo "COOKIE_JAR=/tmp/cookies.txt" >> $GITHUB_ENV
+          if [ -z "$CSRF" ]; then
+            echo "WARNING: CSRF token not auto-extracted. Dumping first 200 lines for debugging."
+            sed -n '1,200p' /tmp/loginpage.html
+            # we do not fail here automatically so user can inspect and adjust patterns
+          else
+            echo "CSRF_TOKEN=$CSRF" >> $GITHUB_ENV
+            echo "COOKIE_JAR=/tmp/cookies.txt" >> $GITHUB_ENV
+            echo "Extracted CSRF token (hidden)."
+          fi
 
-      - name: Pull sqlmap docker image
-        run: docker pull sqlmapproject/sqlmap:latest
-
-      - name: Run sqlmap against login form (POST) — non-interactive
+      - name: Run sqlmap container (non-interactive) and capture output
         env:
-          TARGET_URL: ${{ env.TARGET_URL }}
-          USERNAME: ${{ env.USERNAME }}
+          TARGET: ${{ steps.check.outputs.target }}
+          USERNAME: ${{ steps.check.outputs.username }}
+          PASS_PLACEHOLDER: ${{ steps.check.outputs.password_placeholder }}
+          CSRF_TOKEN: ${{ env.CSRF_TOKEN }}
+          COOKIE_JAR: ${{ env.COOKIE_JAR }}
+          DUMP_ON_FIND: ${{ steps.check.outputs.dump_on_find }}
         run: |
-          # We will attempt to test the username parameter for SQL injection via the login POST.
-          # IMPORTANT: adjust the parameter names (username/password/csrf_token) to match your form.
-          # We use a placeholder password value; sqlmap will attempt injection on the POST parameters.
-          #
-          # If your login form uses different names (e.g., 'user'/'pass') edit accordingly.
-          #
-          # For CSRF-protected forms, the previous step should set CSRF_TOKEN and COOKIE_JAR in env.
-          POST_DATA="username=${USERNAME}&password=placeholder"
-
-          # If csrf token present, append it
-          if [ "${USE_CSRF}" = "true" ]; then
-            if [ -z "${CSRF_TOKEN}" ]; then
-              echo "ERROR: CSRF_TOKEN not found in environment."
-              exit 1
-            fi
-            POST_DATA="${POST_DATA}&csrf_token=${CSRF_TOKEN}"
-            COOKIE_ARG="--cookie-jar=/tmp/cookiejar.txt"
+          set -euo pipefail
+          POST="username=${USERNAME}&password=${PASS_PLACEHOLDER}"
+          if [ -n "${CSRF_TOKEN:-}" ]; then
+            POST="${POST}&csrf_token=${CSRF_TOKEN}"
+            COOKIE_ARG="--cookie=/tmp/cookies.txt"
           else
             COOKIE_ARG=""
           fi
 
-          echo "POST payload to be tested: $POST_DATA"
-          echo "Target URL: $TARGET_URL"
+          echo "Running sqlmap against: $TARGET"
+          echo "POST body (for logging only, token hidden if present):"
+          echo "${POST}" | sed -E 's/(csrf_token=[^&]+)/csrf_token=REDACTED/'
 
-          # Run sqlmap via docker. --batch for non-interactive, adjust --level/--risk as needed.
-          # --data is used to provide POST body. --batch ensures CI-friendly behavior.
-          docker run --rm --network host sqlmapproject/sqlmap:latest \
-            --url="${TARGET_URL}" \
-            --data="${POST_DATA}" \
-            ${COOKIE_ARG} \
-            --batch \
-            --level=3 \
-            --risk=2 \
-            --threads=2 \
-            --timeout=15 \
-            --answers="follow=Y" \
-            --technique=BEUSTQ || true
+          # Build base command; do NOT use --network host to avoid runner-specific issues.
+          BASE_CMD=(docker run --rm my-sqlmap:ci --url "$TARGET" --data "$POST" --batch --level=3 --risk=2 --threads=2 --timeout=15)
 
-          # Notes:
-          # - If the runner refuses `--network host`, modify the command to map ports or run on self-hosted runner where your site is reachable.
-          # - If your site requires custom headers (e.g., custom Authorization) use --headers="Header: value" with sqlmap.
-          # - If you want to dump DB tables, add: --dump or --dump-all (only do so on owned/test systems).
+          # If user requested dump-on-find, append --dump via --keep-alive trick later
+          # We'll capture output into a file for artifact upload.
+          LOGFILE=/tmp/sqlmap_run_output.txt
+          echo "Invoking: ${BASE_CMD[*]}"
+          # Execute and capture exit code but don't fail the job immediately (we want logs)
+          if "${BASE_CMD[@]}" > "$LOGFILE" 2>&1; then
+            echo "sqlmap finished successfully."
+            EXIT_CODE=0
+          else
+            echo "sqlmap finished with non-zero exit (possible no injection or errors)."
+            EXIT_CODE=$?
+          fi
 
-      - name: Save logs (artifact)
+          # If dump_on_find true, try to re-run with --dump if earlier run reported injection (quick heuristic)
+          if [ "${DUMP_ON_FIND:-}" = "true" ]; then
+            if grep -iE "is vulnerable|parameter.*is.*vulnerable" "$LOGFILE" >/dev/null 2>&1; then
+              echo "Vulnerability signature found in initial output — re-running with --dump (ONLY for owned systems)."
+              docker run --rm my-sqlmap:ci --url "$TARGET" --data "$POST" --batch --level=3 --risk=2 --threads=2 --timeout=15 --dump >> "$LOGFILE" 2>&1 || true
+            else
+              echo "No clear vulnerability signature found; skipping --dump."
+            fi
+          fi
+
+          # Show tail of log for quick check
+          echo "===== sqlmap output (tail) ====="
+          tail -n 200 "$LOGFILE" || true
+          # Save log to workspace so artifact step can pick it up
+          cp "$LOGFILE" /tmp/sqlmap_output_saved.txt || true
+          exit $EXIT_CODE
+
+      - name: Upload sqlmap logs as artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sqlmap-logs
-          path: |
-            /tmp/*sqlmap*.log
-            /tmp/loginpage.html
-            /tmp/cookiejar.txt
+          name: sqlmap-output
+          path: /tmp/sqlmap_output_saved.txt
