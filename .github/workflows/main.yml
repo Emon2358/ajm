@@ -31,6 +31,7 @@ jobs:
       - name: Safety/inputs check
         id: check
         run: |
+          set -euxo pipefail
           TARGET="${{ github.event.inputs.target_url || secrets.TARGET_URL }}"
           USER="${{ github.event.inputs.username }}"
           if [ -z "$TARGET" ]; then
@@ -48,13 +49,27 @@ jobs:
             echo "AUTH_PROOF present (not shown)."
           fi
 
-      - name: Install tools
+      - name: Install tools (robust apt)
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y git curl jq docker.io
-          # start docker (runner usually has it, but ensure service)
-          sudo systemctl start docker || true
-          docker --version
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -o Acquire::Retries=3
+          # install essential tools with retry/fix logic
+          if ! sudo apt-get install -y --no-install-recommends git curl jq ca-certificates apt-transport-https gnupg; then
+            echo "apt install failed — attempt to repair broken packages and retry"
+            sudo apt-get -f install -y || true
+            sudo dpkg --configure -a || true
+            sudo apt-get update -o Acquire::Retries=3
+            sudo apt-get install -y --no-install-recommends git curl jq ca-certificates apt-transport-https gnupg
+          fi
+          # cleanup
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+          # verify
+          git --version || true
+          curl --version || true
+          jq --version || true
+          docker --version || true
 
       - name: Clone sqlmap upstream
         run: |
@@ -62,21 +77,37 @@ jobs:
           git clone --depth 1 https://github.com/sqlmapproject/sqlmap.git /tmp/sqlmap_repo
           ls -la /tmp/sqlmap_repo | sed -n '1,120p'
 
-      - name: Create Dockerfile (simple wrapper)
+      - name: Create Dockerfile (robust apt inside image)
         run: |
           cat > /tmp/sqlmap_repo/Dockerfile <<'EOF'
-          FROM python:3.11-slim
-          WORKDIR /sqlmap
-          COPY . /sqlmap
-          # optional: install additional packages if needed
-          RUN apt-get update && apt-get install -y --no-install-recommends git curl && \
-              pip install --no-cache-dir -r requirements.txt 2>/dev/null || true
-          ENTRYPOINT ["python3", "sqlmap.py"]
-          EOF
-          sed -n '1,120p' /tmp/sqlmap_repo/Dockerfile
+FROM python:3.11-slim
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /sqlmap
+COPY . /sqlmap
+
+# Robust apt install: update, install with retries, attempt automatic fix on failure, then clean.
+RUN set -eux; \
+    apt-get update -o Acquire::Retries=3; \
+    if ! apt-get install -y --no-install-recommends git curl ca-certificates build-essential ; then \
+      echo "Initial apt-get install failed; trying to fix broken packages..."; \
+      apt-get -f install -y || true; \
+      dpkg --configure -a || true; \
+      apt-get update -o Acquire::Retries=3; \
+      apt-get install -y --no-install-recommends git curl ca-certificates build-essential; \
+    fi; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+# Install python deps; fail-safe (do not break build on pip issues)
+RUN pip install --no-cache-dir -r requirements.txt 2>/dev/null || true
+
+ENTRYPOINT ["python3", "sqlmap.py"]
+EOF
+          sed -n '1,200p' /tmp/sqlmap_repo/Dockerfile
 
       - name: Build sqlmap docker image
         run: |
+          set -euxo pipefail
           cd /tmp/sqlmap_repo
           sudo docker build -t my-sqlmap:ci .
           sudo docker images my-sqlmap:ci
@@ -84,6 +115,7 @@ jobs:
       - name: (Optional) Extract CSRF token from login page
         if: ${{ github.event.inputs.use_csrf == 'true' }}
         run: |
+          set -euxo pipefail
           TARGET="${{ steps.check.outputs.target }}"
           echo "Fetching login page to try to find CSRF token..."
           curl -s -c /tmp/cookies.txt "$TARGET" -o /tmp/loginpage.html || true
@@ -95,7 +127,6 @@ jobs:
           if [ -z "$CSRF" ]; then
             echo "WARNING: CSRF token not auto-extracted. Dumping first 200 lines for debugging."
             sed -n '1,200p' /tmp/loginpage.html
-            # we do not fail here automatically so user can inspect and adjust patterns
           else
             echo "CSRF_TOKEN=$CSRF" >> $GITHUB_ENV
             echo "COOKIE_JAR=/tmp/cookies.txt" >> $GITHUB_ENV
@@ -107,55 +138,44 @@ jobs:
           TARGET: ${{ steps.check.outputs.target }}
           USERNAME: ${{ steps.check.outputs.username }}
           PASS_PLACEHOLDER: ${{ steps.check.outputs.password_placeholder }}
-          CSRF_TOKEN: ${{ env.CSRF_TOKEN }}
-          COOKIE_JAR: ${{ env.COOKIE_JAR }}
           DUMP_ON_FIND: ${{ steps.check.outputs.dump_on_find }}
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           POST="username=${USERNAME}&password=${PASS_PLACEHOLDER}"
           if [ -n "${CSRF_TOKEN:-}" ]; then
             POST="${POST}&csrf_token=${CSRF_TOKEN}"
-            COOKIE_ARG="--cookie=/tmp/cookies.txt"
+            # cookie jar created earlier if use_csrf true
+            COOKIE_MNT="-v /tmp/cookies.txt:/tmp/cookies.txt:ro"
           else
-            COOKIE_ARG=""
+            COOKIE_MNT=""
           fi
 
-          echo "Running sqlmap against: $TARGET"
-          echo "POST body (for logging only, token hidden if present):"
+          LOGFILE=/tmp/sqlmap_run_output.txt
+          echo "POST (logged with token redacted):"
           echo "${POST}" | sed -E 's/(csrf_token=[^&]+)/csrf_token=REDACTED/'
 
-          # Build base command; do NOT use --network host to avoid runner-specific issues.
-          BASE_CMD=(docker run --rm my-sqlmap:ci --url "$TARGET" --data "$POST" --batch --level=3 --risk=2 --threads=2 --timeout=15)
+          # Note: do not assume --network host is available; use direct public TARGET_URL.
+          docker run --rm $COOKIE_MNT my-sqlmap:ci --url "$TARGET" --data "$POST" --batch --level=3 --risk=2 --threads=2 --timeout=15 > "$LOGFILE" 2>&1 || true
 
-          # If user requested dump-on-find, append --dump via --keep-alive trick later
-          # We'll capture output into a file for artifact upload.
-          LOGFILE=/tmp/sqlmap_run_output.txt
-          echo "Invoking: ${BASE_CMD[*]}"
-          # Execute and capture exit code but don't fail the job immediately (we want logs)
-          if "${BASE_CMD[@]}" > "$LOGFILE" 2>&1; then
-            echo "sqlmap finished successfully."
-            EXIT_CODE=0
-          else
-            echo "sqlmap finished with non-zero exit (possible no injection or errors)."
-            EXIT_CODE=$?
-          fi
-
-          # If dump_on_find true, try to re-run with --dump if earlier run reported injection (quick heuristic)
+          # If dump requested and initial output suggests vulnerability, run --dump
           if [ "${DUMP_ON_FIND:-}" = "true" ]; then
             if grep -iE "is vulnerable|parameter.*is.*vulnerable" "$LOGFILE" >/dev/null 2>&1; then
-              echo "Vulnerability signature found in initial output — re-running with --dump (ONLY for owned systems)."
-              docker run --rm my-sqlmap:ci --url "$TARGET" --data "$POST" --batch --level=3 --risk=2 --threads=2 --timeout=15 --dump >> "$LOGFILE" 2>&1 || true
+              echo "Vulnerability signature found — re-running with --dump (ONLY on owned systems)."
+              docker run --rm $COOKIE_MNT my-sqlmap:ci --url "$TARGET" --data "$POST" --batch --level=3 --risk=2 --threads=2 --timeout=15 --dump >> "$LOGFILE" 2>&1 || true
             else
               echo "No clear vulnerability signature found; skipping --dump."
             fi
           fi
 
-          # Show tail of log for quick check
           echo "===== sqlmap output (tail) ====="
           tail -n 200 "$LOGFILE" || true
-          # Save log to workspace so artifact step can pick it up
           cp "$LOGFILE" /tmp/sqlmap_output_saved.txt || true
-          exit $EXIT_CODE
+          # exit with success if sqlmap found something (heuristic), otherwise exit 0 to avoid failing workflow
+          if grep -iE "is vulnerable|parameter.*is.*vulnerable" "$LOGFILE" >/dev/null 2>&1; then
+            echo "VULNERABILITY_DETECTED=1" >> $GITHUB_OUTPUT
+          else
+            echo "VULNERABILITY_DETECTED=0" >> $GITHUB_OUTPUT
+          fi
 
       - name: Upload sqlmap logs as artifact
         if: always()
